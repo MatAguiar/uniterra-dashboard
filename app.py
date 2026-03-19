@@ -3,14 +3,14 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px  
 from plotly.subplots import make_subplots
-from dash import Dash, dcc, html, Input, Output, State, callback_context
+# Adicionámos o dash_table às importações!
+from dash import Dash, dcc, html, Input, Output, State, callback_context, dash_table
 import dash
 import dash_auth
 
 # 1. LIGAÇÃO DO GOOGLE SHEETS E CREDENCIAIS
 LINK_GOOGLE_SHEETS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRu6rVlR1vXhP5Dsb-XuC0j57q8kp8RPJWfmbmB6Hf-fD5HAayoxtGHbhDLe2IngTxSZcoKqcieZsar/pub?gid=1101979435&single=true&output=csv"
 
-# Defina aqui os utilizadores e palavras-passe para aceder ao site
 USUARIOS_PERMITIDOS = {
     'matheus': '123456',
     'uniterra': 'frota2026',
@@ -84,7 +84,7 @@ estilo_caixa = {'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '
 
 app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor': '#ECEFF1', 'padding': '20px', 'margin': '0'}, children=[
     html.Div(style={'backgroundColor': '#2C3E50', 'color': 'white', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px', 'textAlign': 'center', 'boxShadow': '0 4px 6px rgba(0,0,0,0.2)'}, children=[
-        html.H1("Controlo de Combustível - Uniterra", style={'margin': '0'})
+        html.H1("Controle de Combustível - Uniterra", style={'margin': '0'})
     ]),
     
     html.Div(style=estilo_caixa, children=[
@@ -122,7 +122,10 @@ app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor
             html.Strong("Período de Análise:"),
             dcc.RadioItems(id='radio-tempo', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'})
         ]),
-        dcc.Graph(id='grafico-geral')
+        # Os Gráficos ficam aqui
+        dcc.Graph(id='grafico-geral'),
+        # A Tabela foi extraída para um Div à parte
+        html.Div(id='tabela-geral-container', style={'marginTop': '20px'})
     ]),
     
     html.Div(style=estilo_caixa, children=[
@@ -143,7 +146,10 @@ app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor
                 dcc.RadioItems(id='radio-tempo-maq', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, style={'marginTop': '10px'})
             ])
         ]),
-        dcc.Graph(id='grafico-detalhe')
+        # Gráficos em cima
+        dcc.Graph(id='grafico-detalhe'),
+        # Tabela em baixo
+        html.Div(id='tabela-detalhe-container', style={'marginTop': '20px'})
     ])
 ])
 
@@ -187,26 +193,32 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     if not maquinas_validas and maquinas_disponiveis: maquinas_validas = maquinas_disponiveis
     return opcoes_maquinas, maquinas_validas
 
-# ATUALIZA A VISÃO GERAL
-@app.callback(Output('grafico-geral', 'figure'), Input('check-maquinas', 'value'), Input('radio-tempo', 'value'))
+# ATUALIZA A VISÃO GERAL (AGORA DEVOLVE O GRÁFICO E A TABELA SEPARADOS)
+@app.callback(
+    Output('grafico-geral', 'figure'),
+    Output('tabela-geral-container', 'children'),
+    Input('check-maquinas', 'value'), 
+    Input('radio-tempo', 'value')
+)
 def atualizar_visao_geral(maquinas_selec, meses_selec):
-    if not maquinas_selec or df.empty: return go.Figure().update_layout(title="Nenhuma máquina selecionada.", template="plotly_white", height=300)
+    vazio = html.Div() # Tabela vazia
+    if not maquinas_selec or df.empty: return go.Figure().update_layout(title="Nenhuma máquina selecionada.", template="plotly_white", height=300), vazio
     
     df_filt = df[df['MAQUINA'].isin(maquinas_selec)]
     meses_validos = todos_os_meses[-meses_selec:] if meses_selec > 0 else []
     df_filt = df_filt[df_filt['DATA_REF'].isin(meses_validos)]
-    if df_filt.empty: return go.Figure().update_layout(title="Sem dados para este período.", template="plotly_white", height=300)
+    if df_filt.empty: return go.Figure().update_layout(title="Sem dados para este período.", template="plotly_white", height=300), vazio
 
     lista_meses_texto = sorted(df_filt['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
+    # Reduzido para 2 linhas (só Barras e Treemap)
     fig = make_subplots(
-        rows=3, cols=1, 
+        rows=2, cols=1, 
         vertical_spacing=0.1, 
-        specs=[[{"type": "xy"}], [{"type": "domain"}], [{"type": "table"}]], 
-        subplot_titles=("Total Consumido (Litros) - Evolução Mensal", "Proporção de Consumo por Máquina no Período", "Matriz de Dados do Período (Todas as Selecionadas)")
+        specs=[[{"type": "xy"}], [{"type": "domain"}]], 
+        subplot_titles=("Total Consumido (Litros) - Evolução Mensal", "Proporção de Consumo por Máquina no Período")
     )
 
-    # 1. Gráfico de Barras (Total)
     df_empresa = df_filt.groupby('MES_STR')['QUANT COMB'].sum().reset_index()
     soma_str = f"{df_empresa['QUANT COMB'].sum():,.0f} Litros".replace(',', '.')
     fig.add_trace(go.Bar(x=df_empresa['MES_STR'], y=df_empresa['QUANT COMB'], text=df_empresa['QUANT COMB'].round(0), textposition='auto', marker_color='#27AE60', name='Total', showlegend=False), row=1, col=1)
@@ -217,7 +229,6 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
         'CATEGORIA':'first' 
     }).reset_index().sort_values(by='QUANT COMB', ascending=False)
     
-    # FILTRO CORRIGIDO: Remover zeros e negativos que fazem o Treemap rebentar
     df_resumo_treemap = df_resumo_full[df_resumo_full['QUANT COMB'] > 0].copy()
     
     if not df_resumo_treemap.empty:
@@ -226,10 +237,8 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
         
         mapa_cores = {cat: paleta_cores[i % len(paleta_cores)] for i, cat in enumerate(categorias_unicas)}
         cores_treemap = df_resumo_treemap['CATEGORIA'].map(mapa_cores).tolist()
-        
         df_resumo_treemap['TEXTO_HOVER'] = "Categoria: " + df_resumo_treemap['CATEGORIA']
 
-        # 2. TREEMAP COLORIDO POR CATEGORIA
         fig.add_trace(go.Treemap(
             labels=df_resumo_treemap['MAQUINA'],
             parents=[""] * len(df_resumo_treemap),
@@ -240,38 +249,55 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
             hovertemplate="<b>%{label}</b><br>%{text}<br>Consumo Total: %{value:,.0f} Litros<br>Representa: %{percentRoot:.1%} da seleção<extra></extra>"
         ), row=2, col=1)
 
-        # CORREÇÃO: A LEGENDA FOI MOVIDA PARA A ROW 1 (XY) PARA NÃO CRASHAR O DOMAIN!
         for cat in categorias_unicas:
             fig.add_trace(go.Scatter(
-                x=[None], y=[None],
-                mode='markers',
-                marker=dict(size=15, color=mapa_cores[cat], symbol='square'),
-                name=cat,
-                showlegend=True
+                x=[None], y=[None], mode='markers', marker=dict(size=15, color=mapa_cores[cat], symbol='square'), name=cat, showlegend=True
             ), row=1, col=1)
 
-    # 3. Tabela Completa
+    fig.update_layout(title=f"Soma do Período Filtrado: <b>{soma_str}</b>", template="plotly_white", height=800, showlegend=True, margin=dict(t=50))
+    fig.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
+    
+    # === CRIAÇÃO DA TABELA HTML NATIVA (OTIMIZADA PARA MOBILE) ===
     tabela_litros = df_resumo_full['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
     tabela_consumo = df_resumo_full['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
     
-    fig.add_trace(go.Table(
-        header=dict(values=["<b>Máquina</b>", "<b>Categoria</b>", "<b>Total (Litros)</b>", "<b>Média Consumo</b>"], fill_color='#2C3E50', font=dict(color='white')), 
-        cells=dict(values=[df_resumo_full['MAQUINA'], df_resumo_full['CATEGORIA'], tabela_litros, tabela_consumo], fill_color='#F4F6F7', height=25)
-    ), row=3, col=1)
+    df_table_geral = pd.DataFrame({
+        'Máquina': df_resumo_full['MAQUINA'],
+        'Categoria': df_resumo_full['CATEGORIA'],
+        'Total (Litros)': tabela_litros,
+        'Média Consumo': tabela_consumo
+    })
 
-    fig.update_layout(title=f"Soma do Período Filtrado: <b>{soma_str}</b>", template="plotly_white", height=1100, showlegend=True, margin=dict(t=50))
-    fig.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
-    
-    return fig
+    tabela_geral_ui = html.Div([
+        html.H3("Matriz de Dados do Período", style={'textAlign': 'center', 'color': '#34495E', 'marginBottom': '15px'}),
+        dash_table.DataTable(
+            data=df_table_geral.to_dict('records'),
+            columns=[{'name': i, 'id': i} for i in df_table_geral.columns],
+            style_table={'overflowX': 'auto', 'minWidth': '100%'}, # Rolagem horizontal no telemóvel
+            style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'},
+            style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'},
+            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], # Linhas zebra
+            page_size=10 # Paginação automática para não poluir o ecrã
+        )
+    ])
 
-@app.callback(Output('grafico-detalhe', 'figure'), Input('drop-maquina', 'value'), Input('radio-tempo-maq', 'value'))
+    return fig, tabela_geral_ui
+
+# ATUALIZA A VISÃO DE DETALHE POR MÁQUINA
+@app.callback(
+    Output('grafico-detalhe', 'figure'), 
+    Output('tabela-detalhe-container', 'children'),
+    Input('drop-maquina', 'value'), 
+    Input('radio-tempo-maq', 'value')
+)
 def atualizar_visao_maquina(maq_selec, meses_selec):
-    if not maq_selec or df.empty: return go.Figure().update_layout(title="Sem dados.", template="plotly_white", height=300)
+    vazio = html.Div()
+    if not maq_selec or df.empty: return go.Figure().update_layout(title="Sem dados.", template="plotly_white", height=300), vazio
     
     df_m = df[df['MAQUINA'] == maq_selec]
     meses_validos = todos_os_meses[-meses_selec:] if meses_selec > 0 else []
     df_m = df_m[df_m['DATA_REF'].isin(meses_validos)]
-    if df_m.empty: return go.Figure().update_layout(title="Sem dados para esta máquina no período.", template="plotly_white", height=300)
+    if df_m.empty: return go.Figure().update_layout(title="Sem dados para esta máquina no período.", template="plotly_white", height=300), vazio
 
     df_grp = df_m.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum'}).reset_index()
     lista_meses_texto = sorted(df_grp['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
@@ -279,12 +305,13 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     m_geral = df[df['MAQUINA'] == maq_selec]['CONSUMO'].mean()
     if pd.isna(m_geral): m_geral = 0 
 
+    # Reduzido para 2 linhas (Apenas os Gráficos de Barras)
     fig2 = make_subplots(
-        rows=3, cols=1, 
+        rows=2, cols=1, 
         shared_xaxes=False, 
-        subplot_titles=("Média de Consumo Mensal (Km/L ou Horas/L)", "Total de Combustível Gasto (Litros)", "Histórico de Abastecimentos (Lançamentos)"), 
-        vertical_spacing=0.1,
-        specs=[[{"type": "xy"}], [{"type": "xy"}], [{"type": "domain"}]]
+        subplot_titles=("Média de Consumo Mensal (Km/L ou Horas/L)", "Total de Combustível Gasto (Litros)"), 
+        vertical_spacing=0.15,
+        specs=[[{"type": "xy"}], [{"type": "xy"}]]
     )
     
     fig2.add_trace(go.Bar(x=df_grp['MES_STR'], y=df_grp['CONSUMO'], text=df_grp['CONSUMO'].round(2), textposition='auto', marker_color='#2980B9', name='Consumo'), row=1, col=1)
@@ -294,6 +321,11 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
         
     fig2.add_trace(go.Bar(x=df_grp['MES_STR'], y=df_grp['QUANT COMB'], text=df_grp['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=2, col=1)
 
+    fig2.update_layout(title=f"Desempenho Detalhado: <b>{maq_selec}</b>", template="plotly_white", height=600, showlegend=False)
+    fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
+    fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=2, col=1)
+    
+    # === CRIAÇÃO DA TABELA NATIVA (HISTÓRICO) ===
     df_table = df_m[['DATA', 'QUANT COMB', 'CONSUMO']].copy()
     df_table = df_table.sort_values(by='DATA', ascending=False)
     
@@ -301,26 +333,30 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     litros_str = df_table['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
     consumo_str = df_table['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
 
-    fig2.add_trace(go.Table(
-        header=dict(
-            values=["<b>Data do Abastecimento</b>", "<b>Qtd. Abastecida (Litros)</b>", "<b>Consumo Registado (Km/L)</b>"], 
-            fill_color='#2C3E50', font=dict(color='white', size=14), align='center'
-        ),
-        cells=dict(
-            values=[data_str, litros_str, consumo_str], 
-            fill_color='#F4F6F7', align='center', height=30
-        )
-    ), row=3, col=1)
+    df_table_html = pd.DataFrame({
+        'Data do Abastecimento': data_str,
+        'Qtd. Abastecida (Litros)': litros_str,
+        'Consumo Registado (Km/L)': consumo_str
+    })
 
-    fig2.update_layout(title=f"Desempenho Detalhado: <b>{maq_selec}</b>", template="plotly_white", height=900, showlegend=False)
-    fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
-    fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=2, col=1)
+    tabela_detalhe_ui = html.Div([
+        html.H3("Histórico de Abastecimentos (Lançamentos)", style={'textAlign': 'center', 'color': '#34495E', 'marginBottom': '15px'}),
+        dash_table.DataTable(
+            data=df_table_html.to_dict('records'),
+            columns=[{'name': i, 'id': i} for i in df_table_html.columns],
+            style_table={'overflowX': 'auto', 'minWidth': '100%'}, # Rolagem horizontal nativa
+            style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'},
+            style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'},
+            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], # Linhas zebra
+            page_size=10 # Paginação para evitar páginas gigantes
+        )
+    ])
     
-    return fig2
+    return fig2, tabela_detalhe_ui
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("SERVIDOR WEB INICIADO! (Versão com Bug do Plotly Resolvido)")
+    print("SERVIDOR WEB INICIADO! (Versão Mobile Otimizada)")
     print("Aceda ao seu navegador e escreva: http://127.0.0.1:8050")
     print("="*50 + "\n")
     app.run(debug=False, use_reloader=False)
