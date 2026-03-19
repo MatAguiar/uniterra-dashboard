@@ -3,30 +3,33 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px  
 from plotly.subplots import make_subplots
-# Adicionámos o dash_table às importações!
 from dash import Dash, dcc, html, Input, Output, State, callback_context, dash_table
 import dash
 import dash_auth
 
-# 1. LIGAÇÃO DO GOOGLE SHEETS E CREDENCIAIS
+# 1. LINK DO GOOGLE SHEETS E CREDENCIAIS
 LINK_GOOGLE_SHEETS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRu6rVlR1vXhP5Dsb-XuC0j57q8kp8RPJWfmbmB6Hf-fD5HAayoxtGHbhDLe2IngTxSZcoKqcieZsar/pub?gid=1101979435&single=true&output=csv"
 
+# Defina aqui os usuários e senhas para acessar o site
 USUARIOS_PERMITIDOS = {
     'matheus': '123456',
     'uniterra': 'frota2026',
     'diretoria': 'acesso10'
 }
 
-print("A ligar ao Google Sheets...")
+print("Conectando ao Google Sheets...")
 
 try:
-    df = pd.read_csv(LINK_GOOGLE_SHEETS)
+    # O encoding utf-8-sig remove qualquer caractere fantasma (BOM) que o Google Sheets envie
+    df = pd.read_csv(LINK_GOOGLE_SHEETS, encoding='utf-8-sig')
 except Exception as e:
-    print(f"ERRO: Não foi possível ler a folha de cálculo online. Detalhe: {e}")
+    print(f"ERRO: Não foi possível ler a planilha online. Detalhe: {e}")
     df = pd.DataFrame()
 
 if not df.empty:
-    df.columns = df.columns.str.strip().str.upper()
+    # Limpeza radical de caracteres fantasmas e espaços invisíveis
+    df.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df.columns]
+    
     coluna_km = 'HOR/KM ATUAL' 
     coluna_litros = 'QUANT COMB'
     coluna_mes = 'MÊS REF' 
@@ -37,43 +40,62 @@ if not df.empty:
             df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
             df[col] = pd.to_numeric(df[col], errors='coerce') 
     
-    df['DATA'] = pd.to_datetime(df['DATA'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['DATA'])
+    # Busca inteligente pela coluna de Data
+    coluna_data_real = None
+    for c in df.columns:
+        if c in ['DATA', 'DIA', 'DATA ABASTECIMENTO', 'DATA DO ABASTECIMENTO']:
+            coluna_data_real = c
+            break
 
-    df[coluna_mes] = df[coluna_mes].astype(str)
-    df['DATA_REF'] = pd.to_datetime(df[coluna_mes], errors='coerce')
-    df['MES_STR'] = df['DATA_REF'].dt.strftime('%m/%Y') 
-    df = df.dropna(subset=['DATA_REF'])
+    if coluna_data_real:
+        df['DATA'] = pd.to_datetime(df[coluna_data_real], dayfirst=True, errors='coerce')
+        df = df.dropna(subset=['DATA'])
+    else:
+        print("ALERTA: A coluna 'DATA' não foi encontrada. As colunas disponíveis são:", df.columns.tolist())
+        df['DATA'] = pd.NaT
+
+    if coluna_mes in df.columns:
+        df[coluna_mes] = df[coluna_mes].astype(str)
+        df['DATA_REF'] = pd.to_datetime(df[coluna_mes], errors='coerce')
+        df['MES_STR'] = df['DATA_REF'].dt.strftime('%m/%Y') 
+        df = df.dropna(subset=['DATA_REF'])
 
     df = df.sort_values(by=['MAQUINA', 'DATA'])
     
-    df['KM_VALIDO'] = df[coluna_km].replace(0, np.nan)
-    df['REF_ANTERIOR'] = df.groupby('MAQUINA')['KM_VALIDO'].transform(lambda x: x.ffill().shift(1))
-    df['CONSUMO'] = (df['KM_VALIDO'] - df['REF_ANTERIOR']) / df[coluna_litros]
-    df['CONSUMO'] = df['CONSUMO'].replace([np.inf, -np.inf], np.nan)
-    
-    LIMITE_MAXIMO_CONSUMO = 25 
-    df.loc[(df['CONSUMO'] <= 0) | (df['CONSUMO'] > LIMITE_MAXIMO_CONSUMO), 'CONSUMO'] = np.nan
+    if coluna_km in df.columns and coluna_litros in df.columns:
+        df['KM_VALIDO'] = df[coluna_km].replace(0, np.nan)
+        df['REF_ANTERIOR'] = df.groupby('MAQUINA')['KM_VALIDO'].transform(lambda x: x.ffill().shift(1))
+        df['CONSUMO'] = (df['KM_VALIDO'] - df['REF_ANTERIOR']) / df[coluna_litros]
+        df['CONSUMO'] = df['CONSUMO'].replace([np.inf, -np.inf], np.nan)
+        
+        LIMITE_MAXIMO_CONSUMO = 25 
+        df.loc[(df['CONSUMO'] <= 0) | (df['CONSUMO'] > LIMITE_MAXIMO_CONSUMO), 'CONSUMO'] = np.nan
     
     if coluna_cat in df.columns:
         df[coluna_cat] = df[coluna_cat].fillna('Outros').astype(str)
     else:
         df[coluna_cat] = 'Geral'
 
-    lista_categorias = sorted(df[coluna_cat].unique())
-    lista_maquinas = sorted(df['MAQUINA'].unique())
-    
-    maquinas_cat_df = df[['MAQUINA', coluna_cat]].drop_duplicates().sort_values(by=[coluna_cat, 'MAQUINA'])
-    opcoes_drop_maquina = [{'label': f"{row[coluna_cat]} - {row['MAQUINA']}", 'value': row['MAQUINA']} for idx, row in maquinas_cat_df.iterrows()]
+    if 'MAQUINA' in df.columns:
+        lista_categorias = sorted(df[coluna_cat].unique())
+        lista_maquinas = sorted(df['MAQUINA'].unique())
+        
+        maquinas_cat_df = df[['MAQUINA', coluna_cat]].drop_duplicates().sort_values(by=[coluna_cat, 'MAQUINA'])
+        opcoes_drop_maquina = [{'label': f"{row[coluna_cat]} - {row['MAQUINA']}", 'value': row['MAQUINA']} for idx, row in maquinas_cat_df.iterrows()]
+    else:
+        lista_categorias, lista_maquinas, opcoes_drop_maquina = [], [], []
 
-    todos_os_meses = sorted(df['DATA_REF'].unique())
-    N = len(todos_os_meses)
+    if 'DATA_REF' in df.columns:
+        todos_os_meses = sorted(df['DATA_REF'].unique())
+        N = len(todos_os_meses)
+    else:
+        todos_os_meses, N = [], 0
 else:
     lista_categorias, lista_maquinas, todos_os_meses, N = [], [], [], 0
     opcoes_drop_maquina = []
 
 # =========================================================================
-# INICIAR A APLICAÇÃO DASH (WEB APP)
+# INICIAR O APLICATIVO DASH (WEB APP)
 # =========================================================================
 app = Dash(__name__, title="Uniterra - Frota")
 
@@ -122,9 +144,7 @@ app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor
             html.Strong("Período de Análise:"),
             dcc.RadioItems(id='radio-tempo', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'})
         ]),
-        # Os Gráficos ficam aqui
         dcc.Graph(id='grafico-geral'),
-        # A Tabela foi extraída para um Div à parte
         html.Div(id='tabela-geral-container', style={'marginTop': '20px'})
     ]),
     
@@ -146,9 +166,7 @@ app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor
                 dcc.RadioItems(id='radio-tempo-maq', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, style={'marginTop': '10px'})
             ])
         ]),
-        # Gráficos em cima
         dcc.Graph(id='grafico-detalhe'),
-        # Tabela em baixo
         html.Div(id='tabela-detalhe-container', style={'marginTop': '20px'})
     ])
 ])
@@ -193,7 +211,7 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     if not maquinas_validas and maquinas_disponiveis: maquinas_validas = maquinas_disponiveis
     return opcoes_maquinas, maquinas_validas
 
-# ATUALIZA A VISÃO GERAL (AGORA DEVOLVE O GRÁFICO E A TABELA SEPARADOS)
+# ATUALIZA A VISÃO GERAL
 @app.callback(
     Output('grafico-geral', 'figure'),
     Output('tabela-geral-container', 'children'),
@@ -201,7 +219,7 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     Input('radio-tempo', 'value')
 )
 def atualizar_visao_geral(maquinas_selec, meses_selec):
-    vazio = html.Div() # Tabela vazia
+    vazio = html.Div() 
     if not maquinas_selec or df.empty: return go.Figure().update_layout(title="Nenhuma máquina selecionada.", template="plotly_white", height=300), vazio
     
     df_filt = df[df['MAQUINA'].isin(maquinas_selec)]
@@ -211,7 +229,6 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
 
     lista_meses_texto = sorted(df_filt['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
-    # Reduzido para 2 linhas (só Barras e Treemap)
     fig = make_subplots(
         rows=2, cols=1, 
         vertical_spacing=0.1, 
@@ -257,27 +274,27 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
     fig.update_layout(title=f"Soma do Período Filtrado: <b>{soma_str}</b>", template="plotly_white", height=800, showlegend=True, margin=dict(t=50))
     fig.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
     
-    # === CRIAÇÃO DA TABELA HTML NATIVA (OTIMIZADA PARA MOBILE) ===
     tabela_litros = df_resumo_full['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
     tabela_consumo = df_resumo_full['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
     
+    # Reseta o índice para garantir ordenação limpa sem conflitos com a dash_table
     df_table_geral = pd.DataFrame({
         'Máquina': df_resumo_full['MAQUINA'],
         'Categoria': df_resumo_full['CATEGORIA'],
         'Total (Litros)': tabela_litros,
         'Média Consumo': tabela_consumo
-    })
+    }).reset_index(drop=True)
 
     tabela_geral_ui = html.Div([
         html.H3("Matriz de Dados do Período", style={'textAlign': 'center', 'color': '#34495E', 'marginBottom': '15px'}),
         dash_table.DataTable(
             data=df_table_geral.to_dict('records'),
             columns=[{'name': i, 'id': i} for i in df_table_geral.columns],
-            style_table={'overflowX': 'auto', 'minWidth': '100%'}, # Rolagem horizontal no telemóvel
+            style_table={'overflowX': 'auto', 'minWidth': '100%'}, 
             style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'},
             style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'},
-            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], # Linhas zebra
-            page_size=10 # Paginação automática para não poluir o ecrã
+            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], 
+            page_size=10 
         )
     ])
 
@@ -305,7 +322,6 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     m_geral = df[df['MAQUINA'] == maq_selec]['CONSUMO'].mean()
     if pd.isna(m_geral): m_geral = 0 
 
-    # Reduzido para 2 linhas (Apenas os Gráficos de Barras)
     fig2 = make_subplots(
         rows=2, cols=1, 
         shared_xaxes=False, 
@@ -327,16 +343,18 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     
     # === CRIAÇÃO DA TABELA NATIVA (HISTÓRICO) ===
     df_table = df_m[['DATA', 'QUANT COMB', 'CONSUMO']].copy()
-    df_table = df_table.sort_values(by='DATA', ascending=False)
     
-    data_str = df_table['DATA'].dt.strftime('%d/%m/%Y')
+    # RESETAR O ÍNDICE AQUI RESOLVE O ERRO DA COLUNA EM BRANCO!
+    df_table = df_table.sort_values(by='DATA', ascending=False).reset_index(drop=True)
+    
+    data_str = df_table['DATA'].dt.strftime('%d/%m/%Y').fillna('Sem Data')
     litros_str = df_table['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
     consumo_str = df_table['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
 
     df_table_html = pd.DataFrame({
         'Data do Abastecimento': data_str,
         'Qtd. Abastecida (Litros)': litros_str,
-        'Consumo Registado (Km/L)': consumo_str
+        'Consumo Registrado (Km/L)': consumo_str
     })
 
     tabela_detalhe_ui = html.Div([
@@ -344,11 +362,11 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
         dash_table.DataTable(
             data=df_table_html.to_dict('records'),
             columns=[{'name': i, 'id': i} for i in df_table_html.columns],
-            style_table={'overflowX': 'auto', 'minWidth': '100%'}, # Rolagem horizontal nativa
+            style_table={'overflowX': 'auto', 'minWidth': '100%'}, 
             style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'},
             style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'},
-            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], # Linhas zebra
-            page_size=10 # Paginação para evitar páginas gigantes
+            style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], 
+            page_size=10 
         )
     ])
     
@@ -356,7 +374,7 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("SERVIDOR WEB INICIADO! (Versão Mobile Otimizada)")
-    print("Aceda ao seu navegador e escreva: http://127.0.0.1:8050")
+    print("SERVIDOR WEB INICIADO! (Bug da Coluna de Data Resolvido)")
+    print("Acesse o seu navegador e digite: http://127.0.0.1:8050")
     print("="*50 + "\n")
     app.run(debug=False, use_reloader=False)
