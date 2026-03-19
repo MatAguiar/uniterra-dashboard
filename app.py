@@ -12,176 +12,191 @@ import io
 # 1. LINK DO GOOGLE SHEETS E CREDENCIAIS
 LINK_GOOGLE_SHEETS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRu6rVlR1vXhP5Dsb-XuC0j57q8kp8RPJWfmbmB6Hf-fD5HAayoxtGHbhDLe2IngTxSZcoKqcieZsar/pub?gid=1101979435&single=true&output=csv"
 
-# Defina aqui os usuários e senhas para acessar o site
 USUARIOS_PERMITIDOS = {
     'matheus': '123456',
     'uniterra': 'frota2026',
     'diretoria': 'acesso10'
 }
 
-print("Conectando ao Google Sheets...")
-
-try:
-    # -------------------------------------------------------------------------
-    # NOVO SISTEMA ANTIBLOQUEIO (Disfarce de Navegador + Timeout)
-    # -------------------------------------------------------------------------
-    req = urllib.request.Request(
-        LINK_GOOGLE_SHEETS, 
-        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    )
-    # Impõe um limite máximo de 30 segundos para baixar (evita que o Render trave)
-    with urllib.request.urlopen(req, timeout=30) as response:
-        conteudo_csv = response.read().decode('utf-8-sig') # Lê e remove sujeiras (BOM) do Google
-    
-    df = pd.read_csv(io.StringIO(conteudo_csv))
-    print("Planilha carregada com sucesso!")
-except Exception as e:
-    print(f"ERRO CRÍTICO: Não foi possível ler a planilha online. Detalhe: {e}")
-    df = pd.DataFrame()
-
-if not df.empty:
-    # Limpeza radical de caracteres fantasmas e espaços invisíveis nos cabeçalhos
-    df.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df.columns]
-    
-    coluna_km = 'HOR/KM ATUAL' 
-    coluna_litros = 'QUANT COMB'
-    coluna_mes = 'MÊS REF' 
-    coluna_cat = 'CATEGORIA' 
-
-    for col in [coluna_litros, coluna_km]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
-            df[col] = pd.to_numeric(df[col], errors='coerce') 
-    
-    # =========================================================================
-    # SOLUÇÃO DEFINITIVA PARA A DATA (Força Bruta)
-    # =========================================================================
-    # Pega a primeira coluna do arquivo (índice 0) e força ela a ser a DATA,
-    # ignorando qualquer erro de digitação do almoxarife no cabeçalho!
-    if len(df.columns) > 0:
-        nome_primeira_coluna = df.columns[0]
-        df.rename(columns={nome_primeira_coluna: 'DATA'}, inplace=True)
-
-    df['DATA'] = pd.to_datetime(df['DATA'], dayfirst=True, errors='coerce')
-    df = df.dropna(subset=['DATA'])
-
-    if coluna_mes in df.columns:
-        df[coluna_mes] = df[coluna_mes].astype(str)
-        df['DATA_REF'] = pd.to_datetime(df[coluna_mes], errors='coerce')
-        df['MES_STR'] = df['DATA_REF'].dt.strftime('%m/%Y') 
-        df = df.dropna(subset=['DATA_REF'])
-
-    df = df.sort_values(by=['MAQUINA', 'DATA'])
-    
-    if coluna_km in df.columns and coluna_litros in df.columns:
-        df['KM_VALIDO'] = df[coluna_km].replace(0, np.nan)
-        df['REF_ANTERIOR'] = df.groupby('MAQUINA')['KM_VALIDO'].transform(lambda x: x.ffill().shift(1))
-        df['CONSUMO'] = (df['KM_VALIDO'] - df['REF_ANTERIOR']) / df[coluna_litros]
-        df['CONSUMO'] = df['CONSUMO'].replace([np.inf, -np.inf], np.nan)
-        
-        LIMITE_MAXIMO_CONSUMO = 25 
-        df.loc[(df['CONSUMO'] <= 0) | (df['CONSUMO'] > LIMITE_MAXIMO_CONSUMO), 'CONSUMO'] = np.nan
-    
-    if coluna_cat in df.columns:
-        df[coluna_cat] = df[coluna_cat].fillna('Outros').astype(str)
-    else:
-        df[coluna_cat] = 'Geral'
-
-    if 'MAQUINA' in df.columns:
-        lista_categorias = sorted(df[coluna_cat].unique())
-        lista_maquinas = sorted(df['MAQUINA'].unique())
-        
-        maquinas_cat_df = df[['MAQUINA', coluna_cat]].drop_duplicates().sort_values(by=[coluna_cat, 'MAQUINA'])
-        opcoes_drop_maquina = [{'label': f"{row[coluna_cat]} - {row['MAQUINA']}", 'value': row['MAQUINA']} for idx, row in maquinas_cat_df.iterrows()]
-    else:
-        lista_categorias, lista_maquinas, opcoes_drop_maquina = [], [], []
-
-    if 'DATA_REF' in df.columns:
-        todos_os_meses = sorted(df['DATA_REF'].unique())
-        N = len(todos_os_meses)
-    else:
-        todos_os_meses, N = [], 0
-else:
-    lista_categorias, lista_maquinas, todos_os_meses, N = [], [], [], 0
-    opcoes_drop_maquina = []
-
 # =========================================================================
 # INICIAR O APLICATIVO DASH (WEB APP)
 # =========================================================================
 app = Dash(__name__, title="Uniterra - Frota")
-
 auth = dash_auth.BasicAuth(app, USUARIOS_PERMITIDOS)
 server = app.server 
 
-estilo_caixa = {'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '8px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)', 'marginBottom': '30px'}
+# =========================================================================
+# CACHE GLOBAL (Para armazenar os dados e acelerar o servidor)
+# =========================================================================
+cache = {
+    'df': pd.DataFrame(),
+    'categorias': [],
+    'maquinas': [],
+    'meses': [],
+    'N': 0,
+    'opcoes_drop': []
+}
 
-app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor': '#ECEFF1', 'padding': '20px', 'margin': '0'}, children=[
-    html.Div(style={'backgroundColor': '#2C3E50', 'color': 'white', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px', 'textAlign': 'center', 'boxShadow': '0 4px 6px rgba(0,0,0,0.2)'}, children=[
-        html.H1("Controle de Combustível - Uniterra", style={'margin': '0'})
-    ]),
-    
-    html.Div(style=estilo_caixa, children=[
-        html.H2("1. Visão Geral da Empresa", style={'marginTop': '0', 'color': '#34495E'}),
-        html.Div(style={'backgroundColor': '#F8F9F9', 'padding': '15px', 'borderRadius': '5px', 'marginBottom': '20px'}, children=[
-            
-            html.Strong("Filtro de Categoria:"),
-            html.Div(style={'marginBottom': '10px', 'marginTop': '5px'}, children=[
-                html.Button('Selecionar Todas', id='btn-todas-cat', n_clicks=0, style={'marginRight': '10px', 'cursor': 'pointer', 'backgroundColor': '#3498DB', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'}),
-                html.Button('Limpar Seleção', id='btn-nenhuma-cat', n_clicks=0, style={'cursor': 'pointer', 'backgroundColor': '#95A5A6', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'})
-            ]),
-            dcc.Checklist(
-                id='check-categoria',
-                options=[{'label': cat, 'value': cat} for cat in lista_categorias],
-                value=lista_categorias, 
-                inline=True,
-                inputStyle={'marginRight': '5px', 'marginLeft': '15px'},
-                style={'display': 'flex', 'flexWrap': 'wrap', 'marginBottom': '20px'}
-            ),
+def atualizar_dados():
+    """Baixa os dados do Google Sheets na hora. Se o Render falhar, usa a memória cache."""
+    try:
+        req = urllib.request.Request(
+            LINK_GOOGLE_SHEETS, 
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            conteudo_csv = response.read().decode('utf-8-sig')
+        
+        df = pd.read_csv(io.StringIO(conteudo_csv))
+        
+        if df.empty: return False
 
-            html.Strong("Filtro de Máquinas:"),
-            html.Div(style={'marginBottom': '10px', 'marginTop': '5px'}, children=[
-                html.Button('Selecionar Todas', id='btn-todas', n_clicks=0, style={'marginRight': '10px', 'cursor': 'pointer', 'backgroundColor': '#3498DB', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'}),
-                html.Button('Limpar Seleção', id='btn-nenhuma', n_clicks=0, style={'cursor': 'pointer', 'backgroundColor': '#95A5A6', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'})
-            ]),
-            dcc.Checklist(
-                id='check-maquinas', 
-                options=[{'label': maq, 'value': maq} for maq in lista_maquinas], 
-                value=lista_maquinas, 
-                inline=True, 
-                inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, 
-                style={'display': 'flex', 'flexWrap': 'wrap', 'marginBottom': '15px'}
-            ),
-            
-            html.Strong("Período de Análise:"),
-            dcc.RadioItems(id='radio-tempo', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'})
-        ]),
-        dcc.Graph(id='grafico-geral'),
-        html.Div(id='tabela-geral-container', style={'marginTop': '20px'})
-    ]),
+        # Limpeza radical de caracteres e forçando a primeira coluna a ser DATA
+        df.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df.columns]
+        if len(df.columns) > 0:
+            df.rename(columns={df.columns[0]: 'DATA'}, inplace=True)
+
+        df['DATA'] = pd.to_datetime(df['DATA'], dayfirst=True, errors='coerce')
+        df = df.dropna(subset=['DATA'])
+        
+        coluna_km = 'HOR/KM ATUAL' 
+        coluna_litros = 'QUANT COMB'
+        coluna_mes = 'MÊS REF' 
+        coluna_cat = 'CATEGORIA' 
+
+        for col in [coluna_litros, coluna_km]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
+                df[col] = pd.to_numeric(df[col], errors='coerce') 
+
+        if coluna_mes in df.columns:
+            df[coluna_mes] = df[coluna_mes].astype(str)
+            df['DATA_REF'] = pd.to_datetime(df[coluna_mes], errors='coerce')
+            df['MES_STR'] = df['DATA_REF'].dt.strftime('%m/%Y') 
+            df = df.dropna(subset=['DATA_REF'])
+
+        df = df.sort_values(by=['MAQUINA', 'DATA'])
+        
+        if coluna_km in df.columns and coluna_litros in df.columns:
+            df['KM_VALIDO'] = df[coluna_km].replace(0, np.nan)
+            df['REF_ANTERIOR'] = df.groupby('MAQUINA')['KM_VALIDO'].transform(lambda x: x.ffill().shift(1))
+            df['CONSUMO'] = (df['KM_VALIDO'] - df['REF_ANTERIOR']) / df[coluna_litros]
+            df['CONSUMO'] = df['CONSUMO'].replace([np.inf, -np.inf], np.nan)
+            LIMITE_MAXIMO_CONSUMO = 25 
+            df.loc[(df['CONSUMO'] <= 0) | (df['CONSUMO'] > LIMITE_MAXIMO_CONSUMO), 'CONSUMO'] = np.nan
+        
+        if coluna_cat in df.columns:
+            df[coluna_cat] = df[coluna_cat].fillna('Outros').astype(str)
+        else:
+            df[coluna_cat] = 'Geral'
+
+        # Salva as atualizações no cache
+        cache['df'] = df
+        cache['categorias'] = sorted(df[coluna_cat].unique()) if coluna_cat in df.columns else []
+        cache['maquinas'] = sorted(df['MAQUINA'].unique()) if 'MAQUINA' in df.columns else []
+        
+        if 'MAQUINA' in df.columns and coluna_cat in df.columns:
+            maquinas_cat_df = df[['MAQUINA', coluna_cat]].drop_duplicates().sort_values(by=[coluna_cat, 'MAQUINA'])
+            cache['opcoes_drop'] = [{'label': f"{row[coluna_cat]} - {row['MAQUINA']}", 'value': row['MAQUINA']} for idx, row in maquinas_cat_df.iterrows()]
+        
+        if 'DATA_REF' in df.columns:
+            cache['meses'] = sorted(df['DATA_REF'].unique())
+            cache['N'] = len(cache['meses'])
+
+        return True
+    except Exception as e:
+        print(f"Erro ao baixar dados (usando cache antigo): {e}")
+        return False
+
+# =========================================================================
+# LAYOUT DINÂMICO (Atualiza em tempo real a cada F5 na página)
+# =========================================================================
+def serve_layout():
+    atualizar_dados()
     
-    html.Div(style=estilo_caixa, children=[
-        html.H2("2. Análise Detalhada por Máquina", style={'marginTop': '0', 'color': '#34495E'}),
-        html.Div(style={'display': 'flex', 'gap': '20px', 'backgroundColor': '#F8F9F9', 'padding': '15px', 'borderRadius': '5px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
-            html.Div(style={'flex': '1', 'minWidth': '300px'}, children=[
-                html.Strong("Selecione a Máquina:"),
-                dcc.Dropdown(
-                    id='drop-maquina', 
-                    options=opcoes_drop_maquina, 
-                    value=opcoes_drop_maquina[0]['value'] if opcoes_drop_maquina else None, 
-                    clearable=False, 
-                    style={'marginTop': '5px'}
-                )
-            ]),
-            html.Div(style={'flex': '2', 'minWidth': '300px'}, children=[
-                html.Strong("Período:"),
-                dcc.RadioItems(id='radio-tempo-maq', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, style={'marginTop': '10px'})
-            ])
+    lista_categorias = cache['categorias']
+    lista_maquinas = cache['maquinas']
+    opcoes_drop_maquina = cache['opcoes_drop']
+    N = cache['N']
+
+    if not opcoes_drop_maquina:
+        opcoes_drop_maquina = [{'label': 'Aguardando Dados...', 'value': ''}]
+
+    estilo_caixa = {'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '8px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)', 'marginBottom': '30px'}
+
+    return html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor': '#ECEFF1', 'padding': '20px', 'margin': '0'}, children=[
+        html.Div(style={'backgroundColor': '#2C3E50', 'color': 'white', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px', 'textAlign': 'center', 'boxShadow': '0 4px 6px rgba(0,0,0,0.2)'}, children=[
+            html.H1("Controle de Combustível - Uniterra", style={'margin': '0'})
         ]),
-        dcc.Graph(id='grafico-detalhe'),
-        html.Div(id='tabela-detalhe-container', style={'marginTop': '20px'})
+        
+        html.Div(style=estilo_caixa, children=[
+            html.H2("1. Visão Geral da Empresa", style={'marginTop': '0', 'color': '#34495E'}),
+            html.Div(style={'backgroundColor': '#F8F9F9', 'padding': '15px', 'borderRadius': '5px', 'marginBottom': '20px'}, children=[
+                
+                html.Strong("Filtro de Categoria:"),
+                html.Div(style={'marginBottom': '10px', 'marginTop': '5px'}, children=[
+                    html.Button('Selecionar Todas', id='btn-todas-cat', n_clicks=0, style={'marginRight': '10px', 'cursor': 'pointer', 'backgroundColor': '#3498DB', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'}),
+                    html.Button('Limpar Seleção', id='btn-nenhuma-cat', n_clicks=0, style={'cursor': 'pointer', 'backgroundColor': '#95A5A6', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'})
+                ]),
+                dcc.Checklist(
+                    id='check-categoria',
+                    options=[{'label': cat, 'value': cat} for cat in lista_categorias],
+                    value=lista_categorias, 
+                    inline=True,
+                    inputStyle={'marginRight': '5px', 'marginLeft': '15px'},
+                    style={'display': 'flex', 'flexWrap': 'wrap', 'marginBottom': '20px'}
+                ),
+
+                html.Strong("Filtro de Máquinas:"),
+                html.Div(style={'marginBottom': '10px', 'marginTop': '5px'}, children=[
+                    html.Button('Selecionar Todas', id='btn-todas', n_clicks=0, style={'marginRight': '10px', 'cursor': 'pointer', 'backgroundColor': '#3498DB', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'}),
+                    html.Button('Limpar Seleção', id='btn-nenhuma', n_clicks=0, style={'cursor': 'pointer', 'backgroundColor': '#95A5A6', 'color': 'white', 'border': 'none', 'padding': '5px 10px', 'borderRadius': '3px'})
+                ]),
+                dcc.Checklist(
+                    id='check-maquinas', 
+                    options=[{'label': maq, 'value': maq} for maq in lista_maquinas], 
+                    value=lista_maquinas, 
+                    inline=True, 
+                    inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, 
+                    style={'display': 'flex', 'flexWrap': 'wrap', 'marginBottom': '15px'}
+                ),
+                
+                html.Strong("Período de Análise:"),
+                dcc.RadioItems(id='radio-tempo', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'})
+            ]),
+            dcc.Graph(id='grafico-geral'),
+            html.Div(id='tabela-geral-container', style={'marginTop': '20px'})
+        ]),
+        
+        html.Div(style=estilo_caixa, children=[
+            html.H2("2. Análise Detalhada por Máquina", style={'marginTop': '0', 'color': '#34495E'}),
+            html.Div(style={'display': 'flex', 'gap': '20px', 'backgroundColor': '#F8F9F9', 'padding': '15px', 'borderRadius': '5px', 'marginBottom': '20px', 'flexWrap': 'wrap'}, children=[
+                html.Div(style={'flex': '1', 'minWidth': '300px'}, children=[
+                    html.Strong("Selecione a Máquina:"),
+                    dcc.Dropdown(
+                        id='drop-maquina', 
+                        options=opcoes_drop_maquina, 
+                        value=opcoes_drop_maquina[0]['value'] if opcoes_drop_maquina else None, 
+                        clearable=False, 
+                        style={'marginTop': '5px'}
+                    )
+                ]),
+                html.Div(style={'flex': '2', 'minWidth': '300px'}, children=[
+                    html.Strong("Período:"),
+                    dcc.RadioItems(id='radio-tempo-maq', options=[{'label': 'Este mês', 'value': 1}, {'label': 'Últimos 3 meses', 'value': 3}, {'label': 'Últimos 6 meses', 'value': 6}, {'label': 'Últimos 12 meses', 'value': 12}, {'label': 'Total disponível', 'value': N}], value=N, inline=True, inputStyle={'marginRight': '5px', 'marginLeft': '15px'}, style={'marginTop': '10px'})
+                ])
+            ]),
+            dcc.Graph(id='grafico-detalhe'),
+            html.Div(id='tabela-detalhe-container', style={'marginTop': '20px'})
+        ])
     ])
-])
 
+# O Dash chama esta função toda vez que alguém atualiza a página web
+app.layout = serve_layout
+
+# =========================================================================
+# LÓGICA E CALLBACKS
+# =========================================================================
 @app.callback(
     Output('check-categoria', 'value'),
     Input('btn-todas-cat', 'n_clicks'),
@@ -191,7 +206,7 @@ app.layout = html.Div(style={'fontFamily': 'Arial, sans-serif', 'backgroundColor
 def atualizar_checkboxes_categoria(btn_todas, btn_nenhuma):
     ctx = callback_context
     id_acionado = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
-    if id_acionado == 'btn-todas-cat': return lista_categorias
+    if id_acionado == 'btn-todas-cat': return cache['categorias']
     elif id_acionado == 'btn-nenhuma-cat': return []
     return dash.no_update
 
@@ -208,6 +223,7 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     ctx = callback_context
     id_acionado = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
 
+    df = cache['df']
     if df.empty: return [], []
     if not categorias_selec: maquinas_disponiveis = []
     else: maquinas_disponiveis = sorted(df[df['CATEGORIA'].isin(categorias_selec)]['MAQUINA'].unique())
@@ -222,7 +238,6 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     if not maquinas_validas and maquinas_disponiveis: maquinas_validas = maquinas_disponiveis
     return opcoes_maquinas, maquinas_validas
 
-# ATUALIZA A VISÃO GERAL
 @app.callback(
     Output('grafico-geral', 'figure'),
     Output('tabela-geral-container', 'children'),
@@ -230,7 +245,10 @@ def atualizar_maquinas_por_categoria(categorias_selec, btn_todas, btn_nenhuma, m
     Input('radio-tempo', 'value')
 )
 def atualizar_visao_geral(maquinas_selec, meses_selec):
-    vazio = html.Div() 
+    vazio = html.Div()
+    df = cache['df']
+    todos_os_meses = cache['meses']
+
     if not maquinas_selec or df.empty: return go.Figure().update_layout(title="Nenhuma máquina selecionada.", template="plotly_white", height=300), vazio
     
     df_filt = df[df['MAQUINA'].isin(maquinas_selec)]
@@ -310,7 +328,6 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
 
     return fig, tabela_geral_ui
 
-# ATUALIZA A VISÃO DE DETALHE POR MÁQUINA
 @app.callback(
     Output('grafico-detalhe', 'figure'), 
     Output('tabela-detalhe-container', 'children'),
@@ -319,6 +336,9 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
 )
 def atualizar_visao_maquina(maq_selec, meses_selec):
     vazio = html.Div()
+    df = cache['df']
+    todos_os_meses = cache['meses']
+
     if not maq_selec or df.empty: return go.Figure().update_layout(title="Sem dados.", template="plotly_white", height=300), vazio
     
     df_m = df[df['MAQUINA'] == maq_selec]
@@ -351,9 +371,7 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
     fig2.update_xaxes(categoryorder='array', categoryarray=lista_meses_texto, row=2, col=1)
     
-    # === CRIAÇÃO DA TABELA NATIVA (HISTÓRICO) ===
     df_table = df_m[['DATA', 'QUANT COMB', 'CONSUMO']].copy()
-    
     df_table = df_table.sort_values(by='DATA', ascending=False).reset_index(drop=True)
     
     data_str = df_table['DATA'].dt.strftime('%d/%m/%Y').fillna('Sem Data')
@@ -383,7 +401,7 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("SERVIDOR WEB INICIADO! (Sistema Antibloqueio Ativado)")
+    print("SERVIDOR WEB INICIADO! (Arquitetura em Tempo Real)")
     print("Acesse o seu navegador e digite: http://127.0.0.1:8050")
     print("="*50 + "\n")
     app.run(debug=False, use_reloader=False)
