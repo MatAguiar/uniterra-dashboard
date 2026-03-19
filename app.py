@@ -6,6 +6,8 @@ from plotly.subplots import make_subplots
 from dash import Dash, dcc, html, Input, Output, State, callback_context, dash_table
 import dash
 import dash_auth
+import urllib.request
+import io
 
 # 1. LINK DO GOOGLE SHEETS E CREDENCIAIS
 LINK_GOOGLE_SHEETS = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRu6rVlR1vXhP5Dsb-XuC0j57q8kp8RPJWfmbmB6Hf-fD5HAayoxtGHbhDLe2IngTxSZcoKqcieZsar/pub?gid=1101979435&single=true&output=csv"
@@ -20,14 +22,25 @@ USUARIOS_PERMITIDOS = {
 print("Conectando ao Google Sheets...")
 
 try:
-    # O encoding utf-8-sig remove qualquer caractere fantasma (BOM) que o Google Sheets envie
-    df = pd.read_csv(LINK_GOOGLE_SHEETS, encoding='utf-8-sig')
+    # -------------------------------------------------------------------------
+    # NOVO SISTEMA ANTIBLOQUEIO (Disfarce de Navegador + Timeout)
+    # -------------------------------------------------------------------------
+    req = urllib.request.Request(
+        LINK_GOOGLE_SHEETS, 
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+    )
+    # Impõe um limite máximo de 30 segundos para baixar (evita que o Render trave)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        conteudo_csv = response.read().decode('utf-8-sig') # Lê e remove sujeiras (BOM) do Google
+    
+    df = pd.read_csv(io.StringIO(conteudo_csv))
+    print("Planilha carregada com sucesso!")
 except Exception as e:
-    print(f"ERRO: Não foi possível ler a planilha online. Detalhe: {e}")
+    print(f"ERRO CRÍTICO: Não foi possível ler a planilha online. Detalhe: {e}")
     df = pd.DataFrame()
 
 if not df.empty:
-    # Limpeza radical de caracteres fantasmas e espaços invisíveis
+    # Limpeza radical de caracteres fantasmas e espaços invisíveis nos cabeçalhos
     df.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df.columns]
     
     coluna_km = 'HOR/KM ATUAL' 
@@ -40,19 +53,17 @@ if not df.empty:
             df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
             df[col] = pd.to_numeric(df[col], errors='coerce') 
     
-    # Busca inteligente pela coluna de Data
-    coluna_data_real = None
-    for c in df.columns:
-        if c in ['DATA', 'DIA', 'DATA ABASTECIMENTO', 'DATA DO ABASTECIMENTO']:
-            coluna_data_real = c
-            break
+    # =========================================================================
+    # SOLUÇÃO DEFINITIVA PARA A DATA (Força Bruta)
+    # =========================================================================
+    # Pega a primeira coluna do arquivo (índice 0) e força ela a ser a DATA,
+    # ignorando qualquer erro de digitação do almoxarife no cabeçalho!
+    if len(df.columns) > 0:
+        nome_primeira_coluna = df.columns[0]
+        df.rename(columns={nome_primeira_coluna: 'DATA'}, inplace=True)
 
-    if coluna_data_real:
-        df['DATA'] = pd.to_datetime(df[coluna_data_real], dayfirst=True, errors='coerce')
-        df = df.dropna(subset=['DATA'])
-    else:
-        print("ALERTA: A coluna 'DATA' não foi encontrada. As colunas disponíveis são:", df.columns.tolist())
-        df['DATA'] = pd.NaT
+    df['DATA'] = pd.to_datetime(df['DATA'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['DATA'])
 
     if coluna_mes in df.columns:
         df[coluna_mes] = df[coluna_mes].astype(str)
@@ -277,7 +288,6 @@ def atualizar_visao_geral(maquinas_selec, meses_selec):
     tabela_litros = df_resumo_full['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
     tabela_consumo = df_resumo_full['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
     
-    # Reseta o índice para garantir ordenação limpa sem conflitos com a dash_table
     df_table_geral = pd.DataFrame({
         'Máquina': df_resumo_full['MAQUINA'],
         'Categoria': df_resumo_full['CATEGORIA'],
@@ -344,7 +354,6 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
     # === CRIAÇÃO DA TABELA NATIVA (HISTÓRICO) ===
     df_table = df_m[['DATA', 'QUANT COMB', 'CONSUMO']].copy()
     
-    # RESETAR O ÍNDICE AQUI RESOLVE O ERRO DA COLUNA EM BRANCO!
     df_table = df_table.sort_values(by='DATA', ascending=False).reset_index(drop=True)
     
     data_str = df_table['DATA'].dt.strftime('%d/%m/%Y').fillna('Sem Data')
@@ -374,7 +383,7 @@ def atualizar_visao_maquina(maq_selec, meses_selec):
 
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("SERVIDOR WEB INICIADO! (Bug da Coluna de Data Resolvido)")
+    print("SERVIDOR WEB INICIADO! (Sistema Antibloqueio Ativado)")
     print("Acesse o seu navegador e digite: http://127.0.0.1:8050")
     print("="*50 + "\n")
     app.run(debug=False, use_reloader=False)
