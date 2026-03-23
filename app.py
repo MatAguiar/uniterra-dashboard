@@ -12,7 +12,7 @@ import os
 import socket
 
 # =========================================================================
-# PROTEÇÃO CONTRA TRAVAMENTOS (Timeout Rigoroso)
+# PROTEÇÃO CONTRA TRAVAMENTOS E TIMEOUT
 # =========================================================================
 socket.setdefaulttimeout(15)
 
@@ -34,7 +34,6 @@ auth = dash_auth.BasicAuth(app, USUARIOS_PERMITIDOS)
 server = app.server 
 server.secret_key = os.urllib.request.pathname2url(LINK_GOOGLE_SHEETS) if hasattr(os, 'urllib') else "chave-uniterra"
 
-# Permite que os gráficos sejam gerados depois que a página inicial carrega
 app.config.suppress_callback_exceptions = True
 
 # Memória Interna Rápida
@@ -47,6 +46,31 @@ cache = {
     'N': 0,
     'opcoes_drop': []
 }
+
+def tratar_numeros_br(series):
+    """
+    Escudo de Números: Limpa qualquer bagunça de digitação do Excel/Google Sheets.
+    Aceita '1.500,00', '1500', '1500.50', etc.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+    
+    def limpar(x):
+        if pd.isna(x): return np.nan
+        x = str(x).strip()
+        if x == '': return np.nan
+        
+        if ',' in x:
+            # Formato BR padrão (ex: 1.500,50)
+            return x.replace('.', '').replace(',', '.')
+        elif x.count('.') >= 1:
+            # Trata casos em que a pessoa digitou apenas o separador de milhar (ex: 1.500)
+            partes = x.split('.')
+            if len(partes[-1]) == 3:
+                return x.replace('.', '')
+        return x
+
+    return pd.to_numeric(series.apply(limpar), errors='coerce')
 
 def baixar_e_processar_dados():
     """Baixa os dados das DUAS planilhas em segundo plano e prepara para os gráficos."""
@@ -71,10 +95,10 @@ def baixar_e_processar_dados():
         
         col_km, col_litros, col_mes, col_cat = 'HOR/KM ATUAL', 'QUANT COMB', 'MÊS REF', 'CATEGORIA'
 
+        # Limpeza blindada de números para não quebrar médias
         for col in [col_litros, col_km]:
             if col in df.columns:
-                df[col] = df[col].astype(str).str.replace(',', '.').str.strip()
-                df[col] = pd.to_numeric(df[col], errors='coerce') 
+                df[col] = tratar_numeros_br(df[col])
 
         if col_mes in df.columns:
             df[col_mes] = df[col_mes].astype(str)
@@ -119,24 +143,20 @@ def baixar_e_processar_dados():
         df_ent = pd.read_csv(io.StringIO(conteudo_entrada))
         df_ent.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df_ent.columns]
         
-        # Limpa Litros (ex: 5.000,00 -> 5000.00)
+        # Limpeza blindada de números 
         if 'LITROS' in df_ent.columns:
-            df_ent['LITROS'] = df_ent['LITROS'].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-            df_ent['LITROS'] = pd.to_numeric(df_ent['LITROS'], errors='coerce')
+            df_ent['LITROS'] = tratar_numeros_br(df_ent['LITROS'])
             
-        # Limpa Preço R$/L
         if 'R$/L' in df_ent.columns:
-            df_ent['PRECO'] = df_ent['R$/L'].astype(str).str.replace('R$', '', regex=False).str.replace('"', '', regex=False).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-            df_ent['PRECO'] = pd.to_numeric(df_ent['PRECO'], errors='coerce')
+            df_ent['PRECO'] = df_ent['R$/L'].astype(str).str.replace('R$', '', regex=False).str.replace('"', '', regex=False)
+            df_ent['PRECO'] = tratar_numeros_br(df_ent['PRECO'])
         else:
             df_ent['PRECO'] = np.nan
 
-        # Pega a coluna de data (Força Bruta na primeira coluna se der erro no nome)
         nome_col_data_ent = 'DATA ABAST' if 'DATA ABAST' in df_ent.columns else df_ent.columns[0]
         df_ent['DATA'] = pd.to_datetime(df_ent[nome_col_data_ent], dayfirst=True, errors='coerce')
         df_ent = df_ent.dropna(subset=['DATA'])
         
-        # Alinha as datas para o mesmo formato Mês/Ano do painel principal
         df_ent['DATA_REF'] = pd.to_datetime(df_ent['DATA'].dt.strftime('%Y-%m-01'))
         df_ent['MES_STR'] = df_ent['DATA_REF'].dt.strftime('%m/%Y')
         
@@ -188,9 +208,7 @@ def construir_tela_completa(pathname):
     lista_categorias = cache['categorias']
     lista_maquinas = cache['maquinas']
     opcoes_drop_maquina = cache['opcoes_drop']
-    
     opcoes_drop_cat = [{'label': cat, 'value': cat} for cat in lista_categorias]
-    
     N = cache['N']
     estilo_caixa = {'backgroundColor': 'white', 'padding': '20px', 'borderRadius': '8px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.1)', 'marginBottom': '30px'}
 
@@ -360,7 +378,7 @@ def update_detalhe_cat(cat, meses_n):
     df_g = df_c.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum'}).reset_index()
     lista_meses_texto = sorted(df_g['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
-    m_geral = df[df['CATEGORIA'] == cat]['CONSUMO'].mean()
+    m_geral = df_c['CONSUMO'].mean()
     if pd.isna(m_geral): m_geral = 0 
 
     fig = make_subplots(rows=2, cols=1, vertical_spacing=0.15, subplot_titles=(f"Média Geral de Consumo da Categoria ({cat})", "Total de Combustível Gasto (Litros)"))
@@ -368,7 +386,7 @@ def update_detalhe_cat(cat, meses_n):
     fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['CONSUMO'], text=df_g['CONSUMO'].round(2), textposition='auto', marker_color='#8E44AD', name='Consumo Médio'), row=1, col=1)
     
     if m_geral > 0:
-        fig.add_trace(go.Scatter(x=df_g['MES_STR'], y=[m_geral]*len(df_g), mode='lines', line=dict(color='#E74C3C', dash='dash'), name='Média Histórica'), row=1, col=1)
+        fig.add_hline(y=m_geral, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral:.1f}", annotation_position="top right", row=1, col=1)
         
     fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['QUANT COMB'], text=df_g['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=2, col=1)
     
@@ -405,7 +423,7 @@ def update_detalhe(maq, meses_n):
     
     lista_meses_texto = sorted(df_g['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
-    m_geral = df[df['MAQUINA'] == maq]['CONSUMO'].mean()
+    m_geral = df_m['CONSUMO'].mean()
     if pd.isna(m_geral): m_geral = 0 
 
     fig = make_subplots(rows=2, cols=1, vertical_spacing=0.15, subplot_titles=("Média de Consumo Mensal (Km/L ou Horas/L)", "Total de Combustível Gasto (Litros)"))
@@ -413,7 +431,7 @@ def update_detalhe(maq, meses_n):
     fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['CONSUMO'], text=df_g['CONSUMO'].round(2), textposition='auto', marker_color='#2980B9', name='Consumo'), row=1, col=1)
     
     if m_geral > 0:
-        fig.add_trace(go.Scatter(x=df_g['MES_STR'], y=[m_geral]*len(df_g), mode='lines', line=dict(color='#E74C3C', dash='dash'), name='Média Histórica'), row=1, col=1)
+        fig.add_hline(y=m_geral, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral:.1f}", annotation_position="top right", row=1, col=1)
         
     fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['QUANT COMB'], text=df_g['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=2, col=1)
     
@@ -431,7 +449,7 @@ def update_detalhe(maq, meses_n):
     
     return fig, html.Div([html.H3("Histórico de Abastecimentos", style={'textAlign': 'center', 'color': '#34495E'}), tab])
 
-# 4. BALANÇO ENTRADA VS CONSUMO CALLBACK (MISTO: BARRAS MENSAIS / LINHAS DIÁRIAS)
+# 4. BALANÇO ENTRADA VS CONSUMO CALLBACK
 @app.callback(
     Output('grafico-balanco', 'figure'), Output('tabela-balanco-container', 'children'),
     Input('radio-tempo-balanco', 'value')
@@ -446,7 +464,6 @@ def update_balanco(meses_n):
 
     meses_v = cache['meses'][-meses_n:] if meses_n > 0 else []
     
-    # 1. Prepara dados Mensais para as Barras e Tabela
     if not df_consumo.empty:
         df_c_filt = df_consumo[df_consumo['DATA_REF'].isin(meses_v)]
         cons_grp = df_c_filt.groupby('MES_STR')['QUANT COMB'].sum().reset_index()
@@ -462,57 +479,92 @@ def update_balanco(meses_n):
         df_e_filt = pd.DataFrame()
         ent_grp = pd.DataFrame(columns=['MES_STR', 'Entrada'])
 
-    # Junta as duas tabelas pelo Mês
     df_bal = pd.merge(ent_grp, cons_grp, on='MES_STR', how='outer')
     df_bal['Entrada'] = df_bal['Entrada'].fillna(0)
     df_bal['Consumo'] = df_bal['Consumo'].fillna(0)
     
     if df_bal.empty: return go.Figure(), vazio
     
-    # Garante a ordem cronológica para o eixo X das Barras (Mês/Ano)
     df_bal['DATA_SORT'] = pd.to_datetime(df_bal['MES_STR'], format='%m/%Y')
     df_bal = df_bal.sort_values('DATA_SORT')
     lista_meses_texto = df_bal['MES_STR'].tolist()
 
-    # Criação do Gráfico de Subplots
+    total_entrada = df_bal['Entrada'].sum()
+    total_consumo = df_bal['Consumo'].sum()
+    saldo_total = total_entrada - total_consumo
+
+    str_entrada = f"{total_entrada:,.0f}".replace(',', '.')
+    str_consumo = f"{total_consumo:,.0f}".replace(',', '.')
+    str_saldo = f"{saldo_total:,.0f}".replace(',', '.')
+    cor_saldo = '#27AE60' if saldo_total >= 0 else '#E74C3C' 
+
+    titulo_barras = (
+        f"Comparativo: Volume Comprado vs Consumo da Frota (Por Mês)<br>"
+        f"<sup><b>Total Comprado:</b> <span style='color:#27AE60;'>{str_entrada} L</span> &nbsp;|&nbsp; "
+        f"<b>Total Consumido:</b> <span style='color:#E74C3C;'>{str_consumo} L</span> &nbsp;|&nbsp; "
+        f"<b>Saldo:</b> <span style='color:{cor_saldo};'>{str_saldo} L</span></sup>"
+    )
+
     fig = make_subplots(
         rows=2, cols=1, 
         vertical_spacing=0.15,
         row_heights=[0.6, 0.4], 
-        subplot_titles=("Comparativo: Volume Comprado vs Consumo da Frota (Por Mês)", "Preço Médio do Diesel (R$/L) - Compras Exatas")
+        subplot_titles=(titulo_barras, "Preço Médio do Diesel (R$/L) - Compras Exatas")
     )
     
-    # Linha 1: Barras (Agrupamento Mensal)
     fig.add_trace(go.Bar(x=df_bal['MES_STR'], y=df_bal['Entrada'], name='Entrada (L)', marker_color='#27AE60', text=df_bal['Entrada'].round(0), textposition='auto'), row=1, col=1)
     fig.add_trace(go.Bar(x=df_bal['MES_STR'], y=df_bal['Consumo'], name='Consumo (L)', marker_color='#E74C3C', text=df_bal['Consumo'].round(0), textposition='auto'), row=1, col=1)
     
-    # === NOVAS LINHAS DE MÉDIAS ===
     media_entrada = df_bal['Entrada'].mean()
     media_consumo = df_bal['Consumo'].mean()
     
     if media_entrada > 0:
-        fig.add_trace(go.Scatter(x=df_bal['MES_STR'], y=[media_entrada]*len(df_bal), mode='lines', name='Média de Compra', line=dict(color='#27AE60', dash='dash')), row=1, col=1)
+        fig.add_hline(y=media_entrada, line_dash="dash", line_color="#27AE60", annotation_text="Média do Período", annotation_position="top left", row=1, col=1)
         
     if media_consumo > 0:
-        fig.add_trace(go.Scatter(x=df_bal['MES_STR'], y=[media_consumo]*len(df_bal), mode='lines', name='Média de Consumo', line=dict(color='#E74C3C', dash='dash')), row=1, col=1)
+        fig.add_hline(y=media_consumo, line_dash="dash", line_color="#E74C3C", annotation_text="Média do Período", annotation_position="top right", row=1, col=1)
 
-    # Linha 2: Gráfico de Linhas (Datas exatas de compra para não embolar)
     if not df_e_filt.empty and 'PRECO' in df_e_filt.columns:
         df_preco = df_e_filt.dropna(subset=['DATA', 'PRECO']).groupby('DATA').agg({'PRECO': 'mean'}).reset_index().sort_values('DATA')
         df_preco['DATA_FORMATADA'] = df_preco['DATA'].dt.strftime('%d/%m/%Y')
         
+        # Linha pura com bolinhas (sem texto esmagando)
         fig.add_trace(go.Scatter(
             x=df_preco['DATA'], 
             y=df_preco['PRECO'], 
-            mode='lines+markers+text',
+            mode='lines+markers',
             name='Preço R$/L',
-            text=df_preco['PRECO'].apply(lambda x: f"R$ {x:.2f}".replace('.', ',')),
-            textposition='top center',
-            hovertemplate="Data: %{customdata}<br>Preço: %{text}<extra></extra>",
+            hovertemplate="Data: %{customdata}<br>Preço: R$ %{y:.2f}<extra></extra>",
             customdata=df_preco['DATA_FORMATADA'],
             marker=dict(color='#2980B9', size=8),
             line=dict(color='#3498DB', width=2)
         ), row=2, col=1)
+
+        # Anotações inteligentes (Evita repetição de texto no mesmo local)
+        if not df_preco.empty:
+            anotacoes = {}
+            idx_last = df_preco.index[-1]
+            idx_max = df_preco['PRECO'].idxmax()
+            idx_min = df_preco['PRECO'].idxmin()
+
+            anotacoes[idx_last] = {'texto': f"Atual: R$ {df_preco.loc[idx_last, 'PRECO']:.2f}".replace('.', ','), 'ay': -35, 'ax': 40, 'cor': '#E74C3C'}
+            
+            if idx_max not in anotacoes:
+                anotacoes[idx_max] = {'texto': f"Máx: R$ {df_preco.loc[idx_max, 'PRECO']:.2f}".replace('.', ','), 'ay': -45, 'ax': 0, 'cor': '#2C3E50'}
+                
+            if idx_min not in anotacoes:
+                anotacoes[idx_min] = {'texto': f"Mín: R$ {df_preco.loc[idx_min, 'PRECO']:.2f}".replace('.', ','), 'ay': 45, 'ax': 0, 'cor': '#2C3E50'}
+
+            for idx, conf in anotacoes.items():
+                fig.add_annotation(
+                    x=df_preco.loc[idx, 'DATA'], y=df_preco.loc[idx, 'PRECO'],
+                    text=conf['texto'], showarrow=True, arrowhead=2, arrowsize=1,
+                    ax=conf['ax'], ay=conf['ay'],
+                    font=dict(color="white" if conf['cor'] == '#E74C3C' else conf['cor'], size=11, weight="bold"),
+                    bgcolor=conf['cor'] if conf['cor'] == '#E74C3C' else "white",
+                    bordercolor=conf['cor'], borderwidth=1, borderpad=4,
+                    row=2, col=1
+                )
 
     fig.update_layout(
         barmode='group', 
@@ -523,9 +575,10 @@ def update_balanco(meses_n):
     )
     
     fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
-    fig.update_xaxes(title_text="Data da Compra", tickformat="%d/%m/%Y", row=2, col=1)
     
-    # === TABELA 1: BALANÇO DE SALDO MENSAL ===
+    # Eixo X inclinado para não embolar as datas no rodapé
+    fig.update_xaxes(title_text="Data da Compra", tickformat="%d/%m/%Y", tickangle=-45, row=2, col=1)
+    
     df_bal['Saldo'] = df_bal['Entrada'] - df_bal['Consumo']
     df_bal_reverso = df_bal.sort_values('DATA_SORT', ascending=False)
     
@@ -549,14 +602,12 @@ def update_balanco(meses_n):
         page_size=12
     )
 
-    # === TABELA 2: HISTÓRICO DE PREÇOS / COMPRAS DE DIESEL ===
     if not df_e_filt.empty:
         df_hist_preco = df_e_filt.copy().sort_values(by='DATA', ascending=False).reset_index(drop=True)
         df_hist_preco['DATA'] = df_hist_preco['DATA'].dt.strftime('%d/%m/%Y')
         df_hist_preco['LITROS'] = df_hist_preco['LITROS'].apply(lambda x: f"{x:,.0f} L".replace(',', '.') if pd.notna(x) else "-")
         df_hist_preco['PRECO'] = df_hist_preco['PRECO'].apply(lambda x: f"R$ {x:.2f}".replace('.', ',') if pd.notna(x) else "-")
         
-        # Estrutura as colunas. Puxa fornecedor se ele existir na planilha
         colunas_hist = {'DATA': 'Data da Compra', 'LITROS': 'Volume Comprado', 'PRECO': 'Preço Pago (R$/L)'}
         if 'FORNECEDOR' in df_hist_preco.columns:
             colunas_hist['FORNECEDOR'] = 'Fornecedor'
@@ -578,7 +629,6 @@ def update_balanco(meses_n):
         page_size=10
     )
 
-    # Junta as duas tabelas no container final
     container_tabelas = html.Div([
         html.H3("Balanço Mensal (Entrada vs Saída)", style={'textAlign': 'center', 'color': '#34495E', 'marginTop': '10px'}), 
         tab_balanco,
