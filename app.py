@@ -147,8 +147,15 @@ def baixar_e_processar_dados():
         if 'LITROS' in df_ent.columns:
             df_ent['LITROS'] = tratar_numeros_br(df_ent['LITROS'])
             
-        if 'R$/L' in df_ent.columns:
-            df_ent['PRECO'] = df_ent['R$/L'].astype(str).str.replace('R$', '', regex=False).str.replace('"', '', regex=False)
+        # Busca automática pela coluna de Preço (R$/L, PRECO, PREÇO, VALOR)
+        col_preco = None
+        for col in df_ent.columns:
+            if 'R$' in col or 'PRECO' in col or 'PREÇO' in col or 'VALOR' in col:
+                col_preco = col
+                break
+                
+        if col_preco:
+            df_ent['PRECO'] = df_ent[col_preco].astype(str).str.replace('R$', '', regex=False).str.replace('"', '', regex=False)
             df_ent['PRECO'] = tratar_numeros_br(df_ent['PRECO'])
         else:
             df_ent['PRECO'] = np.nan
@@ -358,7 +365,44 @@ def update_geral(maquinas, meses_n):
     dt = pd.DataFrame({'Máquina': df_res['MAQUINA'], 'Categoria': df_res['CATEGORIA'], 'Total (L)': df_res['QUANT COMB'].map('{:,.0f}'.format), 'Consumo': df_res['CONSUMO'].map('{:.2f}'.format)})
     tab = dash_table.DataTable(data=dt.to_dict('records'), columns=[{'name': i, 'id': i} for i in dt.columns], style_table={'overflowX': 'auto'}, style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'}, style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], page_size=10)
     
-    return fig, html.Div([html.H3("Matriz de Dados do Período", style={'textAlign': 'center', 'color': '#34495E'}), tab])
+    # === NOVA TABELA: 10 ÚLTIMOS ABASTECIMENTOS ===
+    df_ultimos = df_f.sort_values(by='DATA', ascending=False).head(10).copy()
+    
+    # Tenta identificar automaticamente a coluna de motorista/operador
+    col_motorista = None
+    for col in ['MOTORISTA', 'OPERADOR', 'FUNCIONÁRIO', 'FUNCIONARIO']:
+        if col in df_ultimos.columns:
+            col_motorista = col
+            break
+            
+    df_ult10 = pd.DataFrame()
+    df_ult10['Data'] = df_ultimos['DATA'].dt.strftime('%d/%m/%Y')
+    df_ult10['Máquina'] = df_ultimos['MAQUINA']
+    df_ult10['Categoria'] = df_ultimos['CATEGORIA']
+    df_ult10['Quantidade'] = df_ultimos['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
+    
+    if col_motorista:
+        df_ult10['Motorista'] = df_ultimos[col_motorista].fillna('-')
+    else:
+        df_ult10['Motorista'] = '-'
+        
+    df_ult10['Média Consumo'] = df_ultimos['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',') if pd.notna(x) else "S/D")
+    
+    tab_ultimos = dash_table.DataTable(
+        data=df_ult10.to_dict('records'), 
+        columns=[{'name': i, 'id': i} for i in df_ult10.columns], 
+        style_table={'overflowX': 'auto'}, 
+        style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, 
+        style_header={'backgroundColor': '#34495E', 'color': 'white', 'fontWeight': 'bold'}, 
+        style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}]
+    )
+    
+    return fig, html.Div([
+        html.H3("Matriz de Dados do Período", style={'textAlign': 'center', 'color': '#34495E'}), 
+        tab,
+        html.H3("Últimos 10 Abastecimentos da Frota", style={'textAlign': 'center', 'color': '#34495E', 'marginTop': '40px'}),
+        tab_ultimos
+    ])
 
 # 2. CATEGORIA CALLBACK 
 @app.callback(
@@ -528,43 +572,28 @@ def update_balanco(meses_n):
         df_preco = df_e_filt.dropna(subset=['DATA', 'PRECO']).groupby('DATA').agg({'PRECO': 'mean'}).reset_index().sort_values('DATA')
         df_preco['DATA_FORMATADA'] = df_preco['DATA'].dt.strftime('%d/%m/%Y')
         
-        # Linha pura com bolinhas (sem texto esmagando)
+        # Mostrando todos os valores nativamente e garantindo que nunca sejam escondidos
         fig.add_trace(go.Scatter(
             x=df_preco['DATA'], 
             y=df_preco['PRECO'], 
-            mode='lines+markers',
+            mode='lines+markers+text',
             name='Preço R$/L',
+            text=df_preco['PRECO'].apply(lambda x: f"R$ {x:.2f}".replace('.', ',')),
+            textposition='top center',
             hovertemplate="Data: %{customdata}<br>Preço: R$ %{y:.2f}<extra></extra>",
             customdata=df_preco['DATA_FORMATADA'],
             marker=dict(color='#2980B9', size=8),
-            line=dict(color='#3498DB', width=2)
+            line=dict(color='#3498DB', width=2),
+            textfont=dict(size=10, color='#2C3E50', weight='bold'),
+            cliponaxis=False # Impede o gráfico de cortar textos que batem no teto
         ), row=2, col=1)
 
-        # Anotações inteligentes (Evita repetição de texto no mesmo local)
+        # Adiciona um espaço extra na parte superior do gráfico para acomodar os textos confortavelmente
         if not df_preco.empty:
-            anotacoes = {}
-            idx_last = df_preco.index[-1]
-            idx_max = df_preco['PRECO'].idxmax()
-            idx_min = df_preco['PRECO'].idxmin()
-
-            anotacoes[idx_last] = {'texto': f"Atual: R$ {df_preco.loc[idx_last, 'PRECO']:.2f}".replace('.', ','), 'ay': -35, 'ax': 40, 'cor': '#E74C3C'}
-            
-            if idx_max not in anotacoes:
-                anotacoes[idx_max] = {'texto': f"Máx: R$ {df_preco.loc[idx_max, 'PRECO']:.2f}".replace('.', ','), 'ay': -45, 'ax': 0, 'cor': '#2C3E50'}
-                
-            if idx_min not in anotacoes:
-                anotacoes[idx_min] = {'texto': f"Mín: R$ {df_preco.loc[idx_min, 'PRECO']:.2f}".replace('.', ','), 'ay': 45, 'ax': 0, 'cor': '#2C3E50'}
-
-            for idx, conf in anotacoes.items():
-                fig.add_annotation(
-                    x=df_preco.loc[idx, 'DATA'], y=df_preco.loc[idx, 'PRECO'],
-                    text=conf['texto'], showarrow=True, arrowhead=2, arrowsize=1,
-                    ax=conf['ax'], ay=conf['ay'],
-                    font=dict(color="white" if conf['cor'] == '#E74C3C' else conf['cor'], size=11, weight="bold"),
-                    bgcolor=conf['cor'] if conf['cor'] == '#E74C3C' else "white",
-                    bordercolor=conf['cor'], borderwidth=1, borderpad=4,
-                    row=2, col=1
-                )
+            max_preco = df_preco['PRECO'].max()
+            min_preco = df_preco['PRECO'].min()
+            margem = (max_preco - min_preco) * 0.15 if max_preco != min_preco else max_preco * 0.1
+            fig.update_yaxes(range=[min_preco - margem, max_preco + margem], row=2, col=1)
 
     fig.update_layout(
         barmode='group', 
