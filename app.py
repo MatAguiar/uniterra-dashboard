@@ -50,7 +50,6 @@ cache = {
 def tratar_numeros_br(series):
     """
     Escudo de Números: Limpa qualquer bagunça de digitação do Excel/Google Sheets.
-    Aceita '1.500,00', '1500', '1500.50', etc.
     """
     if pd.api.types.is_numeric_dtype(series):
         return series
@@ -61,10 +60,8 @@ def tratar_numeros_br(series):
         if x == '': return np.nan
         
         if ',' in x:
-            # Formato BR padrão (ex: 1.500,50)
             return x.replace('.', '').replace(',', '.')
         elif x.count('.') >= 1:
-            # Trata casos em que a pessoa digitou apenas o separador de milhar (ex: 1.500)
             partes = x.split('.')
             if len(partes[-1]) == 3:
                 return x.replace('.', '')
@@ -95,7 +92,6 @@ def baixar_e_processar_dados():
         
         col_km, col_litros, col_mes, col_cat = 'HOR/KM ATUAL', 'QUANT COMB', 'MÊS REF', 'CATEGORIA'
 
-        # Limpeza blindada de números para não quebrar médias
         for col in [col_litros, col_km]:
             if col in df.columns:
                 df[col] = tratar_numeros_br(df[col])
@@ -111,9 +107,23 @@ def baixar_e_processar_dados():
         if col_km in df.columns and col_litros in df.columns:
             df['KM_VALIDO'] = df[col_km].replace(0, np.nan)
             df['REF_ANTERIOR'] = df.groupby('MAQUINA')['KM_VALIDO'].transform(lambda x: x.ffill().shift(1))
-            df['CONSUMO'] = (df['KM_VALIDO'] - df['REF_ANTERIOR']) / df[col_litros]
+            
+            # CÁLCULO DO TRABALHO DO MÊS (Horas ou Km)
+            df['TRABALHO'] = df['KM_VALIDO'] - df['REF_ANTERIOR']
+            df['TRABALHO'] = df['TRABALHO'].apply(lambda x: x if pd.notna(x) and x > 0 else np.nan)
+            
+            # CÁLCULO DE CONSUMO
+            df['CONSUMO'] = df['TRABALHO'] / df[col_litros]
             df['CONSUMO'] = df['CONSUMO'].replace([np.inf, -np.inf], np.nan)
-            df.loc[(df['CONSUMO'] <= 0) | (df['CONSUMO'] > 25), 'CONSUMO'] = np.nan
+            
+            # ESCUDO ANTI-ERROS: Se o consumo deu um valor impossível (ex: > 25 km/L),
+            # significa que digitaram o KM errado. Anulamos o Consumo E o Trabalho.
+            erros_digitacao = (df['CONSUMO'] <= 0) | (df['CONSUMO'] > 25)
+            df.loc[erros_digitacao, 'CONSUMO'] = np.nan
+            df.loc[erros_digitacao, 'TRABALHO'] = np.nan
+            
+            # Escudo extra de segurança: Nenhuma máquina trabalha mais de 15.000 km/horas entre um abastecimento e outro
+            df.loc[df['TRABALHO'] > 15000, 'TRABALHO'] = np.nan
         
         if col_cat in df.columns:
             df[col_cat] = df[col_cat].fillna('Outros').astype(str)
@@ -143,11 +153,9 @@ def baixar_e_processar_dados():
         df_ent = pd.read_csv(io.StringIO(conteudo_entrada))
         df_ent.columns = [str(c).strip().upper().replace('\ufeff', '').replace('Ï»¿', '') for c in df_ent.columns]
         
-        # Limpeza blindada de números 
         if 'LITROS' in df_ent.columns:
             df_ent['LITROS'] = tratar_numeros_br(df_ent['LITROS'])
             
-        # Busca automática pela coluna de Preço (R$/L, PRECO, PREÇO, VALOR)
         col_preco = None
         for col in df_ent.columns:
             if 'R$' in col or 'PRECO' in col or 'PREÇO' in col or 'VALOR' in col:
@@ -365,10 +373,9 @@ def update_geral(maquinas, meses_n):
     dt = pd.DataFrame({'Máquina': df_res['MAQUINA'], 'Categoria': df_res['CATEGORIA'], 'Total (L)': df_res['QUANT COMB'].map('{:,.0f}'.format), 'Consumo': df_res['CONSUMO'].map('{:.2f}'.format)})
     tab = dash_table.DataTable(data=dt.to_dict('records'), columns=[{'name': i, 'id': i} for i in dt.columns], style_table={'overflowX': 'auto'}, style_cell={'textAlign': 'center', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, style_header={'backgroundColor': '#2C3E50', 'color': 'white', 'fontWeight': 'bold'}, style_data_conditional=[{'if': {'row_index': 'odd'}, 'backgroundColor': '#F4F6F7'}], page_size=10)
     
-    # === NOVA TABELA: 10 ÚLTIMOS ABASTECIMENTOS ===
+    # === TABELA: 10 ÚLTIMOS ABASTECIMENTOS ===
     df_ultimos = df_f.sort_values(by='DATA', ascending=False).head(10).copy()
     
-    # Tenta identificar automaticamente a coluna de motorista/operador
     col_motorista = None
     for col in ['MOTORISTA', 'OPERADOR', 'FUNCIONÁRIO', 'FUNCIONARIO']:
         if col in df_ultimos.columns:
@@ -404,7 +411,7 @@ def update_geral(maquinas, meses_n):
         tab_ultimos
     ])
 
-# 2. CATEGORIA CALLBACK 
+# 2. CATEGORIA CALLBACK (AGORA COM 6 GRÁFICOS INCLUINDO HORAS/KM TRABALHADAS)
 @app.callback(
     Output('grafico-detalhe-cat', 'figure'), Output('tabela-detalhe-cat-container', 'children'),
     Input('drop-categoria-analise', 'value'), Input('radio-tempo-cat', 'value')
@@ -419,25 +426,144 @@ def update_detalhe_cat(cat, meses_n):
     df_c = df_c[df_c['DATA_REF'].isin(meses_v)]
     if df_c.empty: return go.Figure(), vazio
 
-    df_g = df_c.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum'}).reset_index()
+    # Agrupamentos
+    df_g = df_c.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum', 'TRABALHO': 'sum'}).reset_index()
     lista_meses_texto = sorted(df_g['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
-    m_geral = df_c['CONSUMO'].mean()
-    if pd.isna(m_geral): m_geral = 0 
+    df_g_maq = df_c.groupby(['MES_STR', 'MAQUINA']).agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum', 'TRABALHO': 'sum'}).reset_index()
+    df_g_maq['DATA_SORT'] = pd.to_datetime(df_g_maq['MES_STR'], format='%m/%Y')
+    df_g_maq = df_g_maq.sort_values(['DATA_SORT', 'MAQUINA'])
 
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.15, subplot_titles=(f"Média Geral de Consumo da Categoria ({cat})", "Total de Combustível Gasto (Litros)"))
+    # Filtros para não desenhar espaços vazios
+    df_g_maq_c = df_g_maq[df_g_maq['CONSUMO'] > 0].copy()
+    df_g_maq_t = df_g_maq[df_g_maq['TRABALHO'] > 0].copy()
+    df_g_maq_q = df_g_maq[df_g_maq['QUANT COMB'] > 0].copy()
+
+    # Médias Globais
+    m_geral_consumo = df_c['CONSUMO'].mean()
+    m_geral_litros = df_g['QUANT COMB'].mean()
+    m_geral_trabalho = df_g['TRABALHO'].mean()
     
-    fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['CONSUMO'], text=df_g['CONSUMO'].round(2), textposition='auto', marker_color='#8E44AD', name='Consumo Médio'), row=1, col=1)
+    if pd.isna(m_geral_consumo): m_geral_consumo = 0 
+    if pd.isna(m_geral_litros): m_geral_litros = 0
+    if pd.isna(m_geral_trabalho): m_geral_trabalho = 0
+
+    # Layout de 6 Gráficos com simetria e espaçamento de respiro
+    fig = make_subplots(
+        rows=6, cols=1, 
+        vertical_spacing=0.10, 
+        row_heights=[0.12, 0.21, 0.21, 0.12, 0.12, 0.22], 
+        subplot_titles=(
+            f"1. Média Geral de Consumo da Categoria ({cat})", 
+            f"2. Média Mensal de Consumo por Máquina",
+            f"3. Horas/Km Trabalhadas Mensal por Máquina",
+            f"4. Total de Horas/Km Trabalhadas da Categoria ({cat})",
+            f"5. Volume Total de Combustível Gasto ({cat})",
+            f"6. Volume Mensal Gasto por Máquina"
+        )
+    )
     
-    if m_geral > 0:
-        fig.add_hline(y=m_geral, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral:.1f}", annotation_position="top right", row=1, col=1)
+    maquinas_unicas = df_g_maq['MAQUINA'].unique()
+    cores = px.colors.qualitative.Plotly
+    mapa_cores = {m: cores[i % len(cores)] for i, m in enumerate(maquinas_unicas)}
+    
+    # --- ROW 1: Média Consumo Categoria ---
+    fig.add_trace(go.Bar(
+        x=df_g['MES_STR'], y=df_g['CONSUMO'], 
+        text=df_g['CONSUMO'].round(2), textposition='auto', 
+        marker_color='#8E44AD', name='Consumo Categoria', showlegend=False
+    ), row=1, col=1)
+    
+    if m_geral_consumo > 0:
+        fig.add_hline(y=m_geral_consumo, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média: {m_geral_consumo:.1f}", annotation_position="top right", row=1, col=1)
         
-    fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['QUANT COMB'], text=df_g['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=2, col=1)
-    
-    fig.update_layout(title=f"Desempenho da Categoria: <b>{cat}</b>", template="plotly_white", height=600, showlegend=False, font=dict(family="Arial, sans-serif"))
-    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
-    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=2, col=1)
+    # --- ROW 2: Média Consumo Máquina ---
+    cores_maq_c = [mapa_cores[m] for m in df_g_maq_c['MAQUINA']]
+    fig.add_trace(go.Bar(
+        x=[df_g_maq_c['MES_STR'], df_g_maq_c['MAQUINA']], y=df_g_maq_c['CONSUMO'],
+        text=df_g_maq_c['CONSUMO'].apply(lambda x: f"{x:.2f}".replace('.', ',')),
+        textposition='outside', textangle=-90, marker_color=cores_maq_c,
+        name='Consumo Máquina', showlegend=False, cliponaxis=False        
+    ), row=2, col=1)
 
+    if m_geral_consumo > 0:
+        fig.add_hline(y=m_geral_consumo, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média Geral", annotation_position="top right", row=2, col=1)
+
+    # --- ROW 3: Trabalho Máquina (Novo Gráfico) ---
+    cores_maq_t = [mapa_cores[m] for m in df_g_maq_t['MAQUINA']]
+    fig.add_trace(go.Bar(
+        x=[df_g_maq_t['MES_STR'], df_g_maq_t['MAQUINA']], y=df_g_maq_t['TRABALHO'],
+        text=df_g_maq_t['TRABALHO'].apply(lambda x: f"{x:,.0f}".replace(',', '.')),
+        textposition='outside', textangle=-90, marker_color=cores_maq_t,
+        name='Trabalho Máquina', showlegend=False, cliponaxis=False        
+    ), row=3, col=1)
+
+    m_trab_maq = df_g_maq_t['TRABALHO'].mean()
+    if m_trab_maq > 0:
+        fig.add_hline(y=m_trab_maq, line_dash="dash", line_color="#3498DB", annotation_text=f"Média por Máquina", annotation_position="top right", row=3, col=1)
+
+    # --- ROW 4: Trabalho Categoria (Novo Gráfico) ---
+    fig.add_trace(go.Bar(
+        x=df_g['MES_STR'], y=df_g['TRABALHO'], 
+        text=df_g['TRABALHO'].round(0), textposition='auto', 
+        marker_color='#2980B9', name='Trabalho Categoria', showlegend=False
+    ), row=4, col=1)
+
+    if m_geral_trabalho > 0:
+        fig.add_hline(y=m_geral_trabalho, line_dash="dash", line_color="#3498DB", annotation_text=f"Média Mensal", annotation_position="top right", row=4, col=1)
+
+    # --- ROW 5: Litros Categoria ---
+    fig.add_trace(go.Bar(
+        x=df_g['MES_STR'], y=df_g['QUANT COMB'], 
+        text=df_g['QUANT COMB'].round(0), textposition='auto', 
+        marker_color='#F39C12', name='Litros Categoria', showlegend=False
+    ), row=5, col=1)
+
+    if m_geral_litros > 0:
+        fig.add_hline(y=m_geral_litros, line_dash="dash", line_color="#27AE60", annotation_text=f"Média do Período", annotation_position="top right", row=5, col=1)
+
+    # --- ROW 6: Litros Máquina ---
+    cores_maq_q = [mapa_cores[m] for m in df_g_maq_q['MAQUINA']]
+    fig.add_trace(go.Bar(
+        x=[df_g_maq_q['MES_STR'], df_g_maq_q['MAQUINA']], y=df_g_maq_q['QUANT COMB'],
+        text=df_g_maq_q['QUANT COMB'].apply(lambda x: f"{x:,.0f}".replace(',', '.')),
+        textposition='outside', textangle=-90, marker_color=cores_maq_q,
+        name='Litros Máquina', showlegend=False, cliponaxis=False
+    ), row=6, col=1)
+    
+    m_litros_maq = df_g_maq_q['QUANT COMB'].mean()
+    if m_litros_maq > 0:
+        fig.add_hline(y=m_litros_maq, line_dash="dash", line_color="#27AE60", annotation_text=f"Média por Máquina", annotation_position="top right", row=6, col=1)
+
+    # Legenda Fantasma
+    for maq in maquinas_unicas:
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode='markers', marker=dict(color=mapa_cores[maq], symbol='square', size=10), name=maq), row=1, col=1)
+
+    # --- CONFIGURAÇÕES GERAIS ---
+    fig.update_layout(
+        title=f"Visão Completa de Categoria vs Máquinas: <b>{cat}</b>", 
+        template="plotly_white", 
+        height=2400, # Aumentado para 2400px para acomodar os 6 gráficos sem embolar
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(family="Arial, sans-serif"),
+        barmode='group'
+    )
+    
+    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
+    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=4, col=1)
+    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=5, col=1)
+    
+    fig.update_xaxes(tickangle=-90, row=2, col=1)
+    fig.update_xaxes(tickangle=-90, row=3, col=1)
+    fig.update_xaxes(tickangle=-90, row=6, col=1)
+
+    # Margem extra no teto das barras agrupadas
+    if not df_g_maq_c.empty: fig.update_yaxes(range=[0, df_g_maq_c['CONSUMO'].max() * 1.4], row=2, col=1)
+    if not df_g_maq_t.empty: fig.update_yaxes(range=[0, df_g_maq_t['TRABALHO'].max() * 1.4], row=3, col=1)
+    if not df_g_maq_q.empty: fig.update_yaxes(range=[0, df_g_maq_q['QUANT COMB'].max() * 1.4], row=6, col=1)
+
+    # --- TABELA DE HISTÓRICO ---
     df_h = df_c[['DATA', 'MAQUINA', 'QUANT COMB', 'CONSUMO']].sort_values(by='DATA', ascending=False).reset_index(drop=True)
     df_h['DATA'] = df_h['DATA'].dt.strftime('%d/%m/%Y')
     df_h['QUANT COMB'] = df_h['QUANT COMB'].apply(lambda x: f"{x:,.0f} L".replace(',', '.'))
@@ -448,7 +574,7 @@ def update_detalhe_cat(cat, meses_n):
     
     return fig, html.Div([html.H3(f"Histórico de Abastecimentos - {cat}", style={'textAlign': 'center', 'color': '#34495E'}), tab])
 
-# 3. MÁQUINA CALLBACK
+# 3. MÁQUINA CALLBACK (AGORA COM 3 GRÁFICOS INCLUINDO HORAS/KM TRABALHADAS)
 @app.callback(
     Output('grafico-detalhe', 'figure'), Output('tabela-detalhe-container', 'children'),
     Input('drop-maquina', 'value'), Input('radio-tempo-maq', 'value')
@@ -463,25 +589,44 @@ def update_detalhe(maq, meses_n):
     df_m = df_m[df_m['DATA_REF'].isin(meses_v)]
     if df_m.empty: return go.Figure(), vazio
 
-    df_g = df_m.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum'}).reset_index()
+    # Adicionado 'TRABALHO' no agrupamento mensal
+    df_g = df_m.groupby('MES_STR').agg({'CONSUMO': 'mean', 'QUANT COMB': 'sum', 'TRABALHO': 'sum'}).reset_index()
     
     lista_meses_texto = sorted(df_g['MES_STR'].unique(), key=lambda x: pd.to_datetime(x, format='%m/%Y'))
     
-    m_geral = df_m['CONSUMO'].mean()
-    if pd.isna(m_geral): m_geral = 0 
+    m_geral_cons = df_m['CONSUMO'].mean()
+    m_geral_trab = df_g['TRABALHO'].mean()
+    m_geral_lit = df_g['QUANT COMB'].mean()
+    
+    if pd.isna(m_geral_cons): m_geral_cons = 0 
+    if pd.isna(m_geral_trab): m_geral_trab = 0 
+    if pd.isna(m_geral_lit): m_geral_lit = 0 
 
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.15, subplot_titles=("Média de Consumo Mensal (Km/L ou Horas/L)", "Total de Combustível Gasto (Litros)"))
+    fig = make_subplots(
+        rows=3, cols=1, 
+        vertical_spacing=0.15, 
+        subplot_titles=("Média de Consumo Mensal (Km/L ou Horas/L)", "Horas/Km Trabalhadas no Mês", "Total de Combustível Gasto (Litros)")
+    )
     
+    # Linha 1: Consumo
     fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['CONSUMO'], text=df_g['CONSUMO'].round(2), textposition='auto', marker_color='#2980B9', name='Consumo'), row=1, col=1)
-    
-    if m_geral > 0:
-        fig.add_hline(y=m_geral, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral:.1f}", annotation_position="top right", row=1, col=1)
+    if m_geral_cons > 0:
+        fig.add_hline(y=m_geral_cons, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral_cons:.1f}", annotation_position="top right", row=1, col=1)
         
-    fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['QUANT COMB'], text=df_g['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=2, col=1)
+    # Linha 2: Trabalho
+    fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['TRABALHO'], text=df_g['TRABALHO'].round(0), textposition='auto', marker_color='#8E44AD', name='Trabalho'), row=2, col=1)
+    if m_geral_trab > 0:
+        fig.add_hline(y=m_geral_trab, line_dash="dash", line_color="#8E44AD", annotation_text=f"Média do Período: {m_geral_trab:.0f}", annotation_position="top right", row=2, col=1)
+
+    # Linha 3: Litros
+    fig.add_trace(go.Bar(x=df_g['MES_STR'], y=df_g['QUANT COMB'], text=df_g['QUANT COMB'].round(0), textposition='auto', marker_color='#F39C12', name='Litros'), row=3, col=1)
+    if m_geral_lit > 0:
+        fig.add_hline(y=m_geral_lit, line_dash="dash", line_color="#E74C3C", annotation_text=f"Média do Período: {m_geral_lit:.0f}", annotation_position="top right", row=3, col=1)
     
-    fig.update_layout(title=f"Desempenho Detalhado: <b>{maq}</b>", template="plotly_white", height=600, showlegend=False, font=dict(family="Arial, sans-serif"))
+    fig.update_layout(title=f"Desempenho Detalhado: <b>{maq}</b>", template="plotly_white", height=900, showlegend=False, font=dict(family="Arial, sans-serif"))
     fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
     fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=2, col=1)
+    fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=3, col=1)
 
     df_h = df_m[['DATA', 'QUANT COMB', 'CONSUMO']].sort_values(by='DATA', ascending=False).reset_index(drop=True)
     df_h['DATA'] = df_h['DATA'].dt.strftime('%d/%m/%Y')
@@ -572,7 +717,6 @@ def update_balanco(meses_n):
         df_preco = df_e_filt.dropna(subset=['DATA', 'PRECO']).groupby('DATA').agg({'PRECO': 'mean'}).reset_index().sort_values('DATA')
         df_preco['DATA_FORMATADA'] = df_preco['DATA'].dt.strftime('%d/%m/%Y')
         
-        # Mostrando todos os valores nativamente e garantindo que nunca sejam escondidos
         fig.add_trace(go.Scatter(
             x=df_preco['DATA'], 
             y=df_preco['PRECO'], 
@@ -585,10 +729,9 @@ def update_balanco(meses_n):
             marker=dict(color='#2980B9', size=8),
             line=dict(color='#3498DB', width=2),
             textfont=dict(size=10, color='#2C3E50', weight='bold'),
-            cliponaxis=False # Impede o gráfico de cortar textos que batem no teto
+            cliponaxis=False
         ), row=2, col=1)
 
-        # Adiciona um espaço extra na parte superior do gráfico para acomodar os textos confortavelmente
         if not df_preco.empty:
             max_preco = df_preco['PRECO'].max()
             min_preco = df_preco['PRECO'].min()
@@ -605,7 +748,6 @@ def update_balanco(meses_n):
     
     fig.update_xaxes(type='category', categoryorder='array', categoryarray=lista_meses_texto, row=1, col=1)
     
-    # Eixo X inclinado para não embolar as datas no rodapé
     fig.update_xaxes(title_text="Data da Compra", tickformat="%d/%m/%Y", tickangle=-45, row=2, col=1)
     
     df_bal['Saldo'] = df_bal['Entrada'] - df_bal['Consumo']
